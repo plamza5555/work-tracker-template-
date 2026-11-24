@@ -84,8 +84,25 @@
     undoStack: [],
     newTaskAttachments: [],
     editingTaskAttachments: [],
-    googleAccessToken: sessionStorage.getItem('work_tracker_gdrive_token') || null
+    googleAccessToken: getValidGoogleToken()
   };
+
+  function getValidGoogleToken() {
+    try {
+      const token = localStorage.getItem('work_tracker_gdrive_token') || sessionStorage.getItem('work_tracker_gdrive_token');
+      const exp = parseInt(localStorage.getItem('work_tracker_gdrive_token_exp') || '0', 10);
+      if (!token) return null;
+      if (exp && Date.now() >= exp) {
+        localStorage.removeItem('work_tracker_gdrive_token');
+        localStorage.removeItem('work_tracker_gdrive_token_exp');
+        sessionStorage.removeItem('work_tracker_gdrive_token');
+        return null;
+      }
+      return token;
+    } catch (e) {
+      return null;
+    }
+  }
 
   // --- Storage Helper Functions ---
   function loadFromStorage() {
@@ -194,22 +211,33 @@
     showToast(`↩️ ย้อนกลับ: ${previous.desc} เรียบร้อยแล้ว`);
   }
 
+  function updateLocalTimestamp() {
+    state.localUpdatedAt = Date.now();
+    try {
+      localStorage.setItem('work_tracker_local_updated_at', state.localUpdatedAt.toString());
+    } catch (e) {}
+  }
+
   function saveLabels() {
+    updateLocalTimestamp();
     localStorage.setItem('work_tracker_labels', JSON.stringify(state.labels));
     pushToCloud();
   }
 
   function saveTasks() {
+    updateLocalTimestamp();
     localStorage.setItem('work_tracker_tasks', JSON.stringify(state.tasks));
     pushToCloud();
   }
 
   function saveHolidays() {
+    updateLocalTimestamp();
     localStorage.setItem('work_tracker_holidays', JSON.stringify(state.holidays || {}));
     pushToCloud();
   }
 
   function saveSettings() {
+    updateLocalTimestamp();
     localStorage.setItem('work_tracker_colorblind', JSON.stringify(state.colorblindMode));
     localStorage.setItem('work_tracker_theme', state.theme);
     pushToCloud();
@@ -356,9 +384,25 @@
     cloudStatusTitle: document.getElementById('cloudStatusTitle'),
     cloudStatusSubtitle: document.getElementById('cloudStatusSubtitle'),
     tabBtnAccount: document.getElementById('tabBtnAccount'),
+    tabBtnHistory: document.getElementById('tabBtnHistory'),
     tabBtnConfig: document.getElementById('tabBtnConfig'),
     panelAccount: document.getElementById('panelAccount'),
+    panelHistory: document.getElementById('panelHistory'),
     panelConfig: document.getElementById('panelConfig'),
+    cloudHistoryList: document.getElementById('cloudHistoryList'),
+    btnRefreshHistory: document.getElementById('btnRefreshHistory'),
+
+    // Conflict Modal Elements
+    syncConflictModal: document.getElementById('syncConflictModal'),
+    btnCloseConflictModal: document.getElementById('btnCloseConflictModal'),
+    conflictCloudTime: document.getElementById('conflictCloudTime'),
+    conflictCloudStats: document.getElementById('conflictCloudStats'),
+    conflictLocalTime: document.getElementById('conflictLocalTime'),
+    conflictLocalStats: document.getElementById('conflictLocalStats'),
+    conflictLocalDiffTag: document.getElementById('conflictLocalDiffTag'),
+    btnConflictUseCloud: document.getElementById('btnConflictUseCloud'),
+    btnConflictMerge: document.getElementById('btnConflictMerge'),
+    btnConflictUseLocal: document.getElementById('btnConflictUseLocal'),
     viewLoggedIn: document.getElementById('viewLoggedIn'),
     viewLoggedOut: document.getElementById('viewLoggedOut'),
     userEmailDisplay: document.getElementById('userEmailDisplay'),
@@ -503,8 +547,7 @@
       state.firebaseAuth.getRedirectResult().then((result) => {
         if (result && result.user) {
           if (result.credential && result.credential.accessToken) {
-            state.googleAccessToken = result.credential.accessToken;
-            sessionStorage.setItem('work_tracker_gdrive_token', state.googleAccessToken);
+            saveGoogleDriveToken(result.credential.accessToken);
           }
           showToast(`🎉 ยินดีต้อนรับ ${result.user.displayName || result.user.email}!`);
           pushToCloud(true);
@@ -548,6 +591,9 @@
       if (el.cloudStatusBanner) {
         el.cloudStatusBanner.className = 'cloud-status-banner banner-online';
       }
+    } else if (status === 'pending') {
+      el.cloudStatusDot.classList.add('dot-syncing');
+      el.cloudStatusText.textContent = detail || 'รอซิงก์...';
     } else if (status === 'syncing') {
       el.cloudStatusDot.classList.add('dot-syncing');
       el.cloudStatusText.textContent = 'กำลังซิงก์...';
@@ -620,6 +666,243 @@
     }
   }
 
+  const CLOUD_SYNC_DEBOUNCE_MS = 7000; // ซิงก์ทุก 7 วินาที (ช่วง 5-10 วินาทีตามที่ผู้ใช้ต้องการ)
+  let cloudSyncCountdownTimer = null;
+  let cloudSyncSecondsRemaining = 7;
+  let isConflictModalOpen = false;
+  let pendingConflictCloudData = null;
+
+  function countTasks(tasksObj) {
+    if (!tasksObj) return 0;
+    let count = 0;
+    Object.keys(tasksObj).forEach(d => {
+      if (Array.isArray(tasksObj[d])) count += tasksObj[d].length;
+    });
+    return count;
+  }
+
+  function getTaskSummaryStats(tasksObj) {
+    if (!tasksObj) return { total: 0, done: 0, pending: 0 };
+    let total = 0, done = 0;
+    Object.keys(tasksObj).forEach(date => {
+      const list = tasksObj[date];
+      if (Array.isArray(list)) {
+        total += list.length;
+        done += list.filter(t => t.done).length;
+      }
+    });
+    return { total, done, pending: total - done };
+  }
+
+  function formatFullDateTimeThai(date) {
+    if (!date || isNaN(date.getTime())) return 'ไม่ระบุเวลา';
+    const day = date.getDate();
+    const months = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
+    const month = months[date.getMonth()];
+    const year = date.getFullYear() + 543;
+    const h = String(date.getHours()).padStart(2, '0');
+    const m = String(date.getMinutes()).padStart(2, '0');
+    const s = String(date.getSeconds()).padStart(2, '0');
+    return `${day} ${month} ${year} เวลา ${h}:${m}:${s} น.`;
+  }
+
+  function openSyncConflictModal(cloudData, localTime) {
+    isConflictModalOpen = true;
+    pendingConflictCloudData = cloudData;
+
+    const cloudDate = new Date(cloudData.updatedAt || Date.now());
+    const localDate = new Date(localTime || Date.now());
+    const cloudStats = getTaskSummaryStats(cloudData.tasks);
+    const localStats = getTaskSummaryStats(state.tasks);
+
+    if (el.conflictCloudTime) el.conflictCloudTime.textContent = '⏱️ ' + formatFullDateTimeThai(cloudDate);
+    if (el.conflictCloudStats) el.conflictCloudStats.textContent = `📋 งานทั้งหมด ${cloudStats.total} งาน (เสร็จแล้ว ${cloudStats.done}, รอทำ ${cloudStats.pending})`;
+
+    if (el.conflictLocalTime) el.conflictLocalTime.textContent = '⏱️ ' + formatFullDateTimeThai(localDate);
+    if (el.conflictLocalStats) el.conflictLocalStats.textContent = `📋 งานทั้งหมด ${localStats.total} งาน (เสร็จแล้ว ${localStats.done}, รอทำ ${localStats.pending})`;
+
+    const diffMinutes = Math.round(((cloudData.updatedAt || Date.now()) - localTime) / 60000);
+    if (el.conflictLocalDiffTag) {
+      el.conflictLocalDiffTag.textContent = diffMinutes > 60 ? `เก่ากว่า ~${Math.round(diffMinutes / 60)} ชม.` : (diffMinutes > 0 ? `เก่ากว่า ${diffMinutes} นาที` : 'ข้อมูลเก่ากว่า');
+    }
+
+    if (el.syncConflictModal) el.syncConflictModal.classList.add('active');
+  }
+
+  function closeSyncConflictModal() {
+    isConflictModalOpen = false;
+    pendingConflictCloudData = null;
+    if (el.syncConflictModal) el.syncConflictModal.classList.remove('active');
+  }
+
+  function applyRemoteData(val) {
+    if (!val) return;
+    state.isSyncingFromRemote = true;
+    try {
+      if (val.tasks) state.tasks = val.tasks;
+      if (val.labels) state.labels = val.labels;
+      if (val.holidays) state.holidays = val.holidays;
+      if (val.colorblindMode !== undefined) state.colorblindMode = val.colorblindMode;
+
+      localStorage.setItem('work_tracker_tasks', JSON.stringify(state.tasks));
+      localStorage.setItem('work_tracker_labels', JSON.stringify(state.labels));
+      localStorage.setItem('work_tracker_holidays', JSON.stringify(state.holidays || {}));
+      localStorage.setItem('work_tracker_colorblind', JSON.stringify(state.colorblindMode));
+
+      state.lastSyncTimestamp = new Date(val.updatedAt || Date.now());
+      state.localUpdatedAt = val.updatedAt || Date.now();
+      localStorage.setItem('work_tracker_local_updated_at', state.localUpdatedAt.toString());
+      updateSyncTimestampDisplay();
+
+      renderCalendar();
+      updateTagFilterSelect();
+      if (state.activeModalDate) renderDayTasks();
+    } finally {
+      state.isSyncingFromRemote = false;
+    }
+  }
+
+  function mergeTasksData(localTasks, cloudTasks) {
+    const result = {};
+    const allDates = new Set([
+      ...Object.keys(localTasks || {}),
+      ...Object.keys(cloudTasks || {})
+    ]);
+
+    allDates.forEach(dateKey => {
+      const localList = (localTasks && localTasks[dateKey]) || [];
+      const cloudList = (cloudTasks && cloudTasks[dateKey]) || [];
+
+      const map = new Map();
+
+      // เอา Cloud เป็นตัวตั้งต้น
+      cloudList.forEach(t => {
+        if (t && t.id) map.set(t.id, { ...t });
+      });
+
+      // รวมงานจาก Local เข้าไป
+      localList.forEach(lt => {
+        if (!lt || !lt.id) return;
+        if (!map.has(lt.id)) {
+          // มีเฉพาะในเครื่องนี้ ให้ดึงมาใส่ด้วย (ไม่ให้งานหล่นหาย)
+          map.set(lt.id, { ...lt });
+        } else {
+          // มีทั้งคู่ รวมสถานะและไฟล์แนบ
+          const ct = map.get(lt.id);
+          const done = lt.done || ct.done;
+          const tags = Array.from(new Set([...(lt.tags || []), ...(ct.tags || [])]));
+          const attMap = new Map();
+          (ct.attachments || []).forEach(a => attMap.set(a.name || a.id, a));
+          (lt.attachments || []).forEach(a => {
+            if (!attMap.has(a.name || a.id) || a.uploadedToDrive) {
+              attMap.set(a.name || a.id, a);
+            }
+          });
+
+          map.set(lt.id, {
+            ...ct,
+            ...lt,
+            done,
+            tags,
+            attachments: Array.from(attMap.values())
+          });
+        }
+      });
+
+      result[dateKey] = Array.from(map.values());
+    });
+
+    return result;
+  }
+
+  function pruneCloudHistory(uid) {
+    if (!state.firebaseDb || !uid) return;
+    const historyRef = state.firebaseDb.ref('users/' + uid + '/history');
+    historyRef.limitToFirst(35).once('value', (snap) => {
+      const data = snap.val();
+      if (!data) return;
+      const keys = Object.keys(data).sort();
+      if (keys.length > 20) {
+        const toDelete = keys.slice(0, keys.length - 20);
+        toDelete.forEach(k => historyRef.child(k).remove());
+      }
+    });
+  }
+
+  function loadCloudHistory() {
+    if (!el.cloudHistoryList) return;
+    if (!state.cloudUser || !state.firebaseDb) {
+      el.cloudHistoryList.innerHTML = '<div style="text-align: center; color: var(--text-muted); font-size: 0.82rem; padding: 20px;">กรุณาเข้าสู่ระบบ Cloud เพื่อดูประวัติย้อนหลัง</div>';
+      return;
+    }
+
+    el.cloudHistoryList.innerHTML = '<div style="text-align: center; color: var(--text-muted); font-size: 0.82rem; padding: 20px;">กำลังโหลดประวัติย้อนหลัง...</div>';
+
+    const historyRef = state.firebaseDb.ref('users/' + state.cloudUser.uid + '/history');
+    historyRef.limitToLast(20).once('value', (snap) => {
+      const data = snap.val();
+      if (!data || Object.keys(data).length === 0) {
+        el.cloudHistoryList.innerHTML = '<div style="text-align: center; color: var(--text-muted); font-size: 0.82rem; padding: 20px;">ยังไม่มีประวัติการบันทึกย้อนหลัง (จะเริ่มบันทึกอัตโนมัติเมื่อมีการซิงก์งาน)</div>';
+        return;
+      }
+
+      el.cloudHistoryList.innerHTML = '';
+      const keys = Object.keys(data).sort().reverse(); // Newest first
+
+      keys.forEach(k => {
+        const item = data[k];
+        const dateObj = new Date(item.savedAt || parseInt(k, 10));
+        const timeStr = formatFullDateTimeThai(dateObj);
+        const deviceStr = item.device || '💻 คอมพิวเตอร์';
+        const tasksTxt = `งานทั้งหมด ${item.totalTasks || 0} งาน (เสร็จแล้ว ${item.doneTasks || 0}, รอทำ ${item.pendingTasks || 0})`;
+
+        const row = document.createElement('div');
+        row.className = 'cloud-history-item';
+        row.innerHTML = `
+          <div class="history-item-left">
+            <span class="history-item-time">⏱️ ${timeStr}</span>
+            <span class="history-item-details">${deviceStr} • ${tasksTxt}</span>
+          </div>
+          <button type="button" class="history-restore-btn" data-key="${k}">
+            🔄 กู้คืนข้อมูลนี้
+          </button>
+        `;
+
+        const btn = row.querySelector('.history-restore-btn');
+        btn.addEventListener('click', () => {
+          if (confirm(`คุณต้องการกู้คืนข้อมูลจากวันที่:\n${timeStr}\n\n(ข้อมูลปัจจุบันจะถูกแทนที่ด้วยข้อมูลชุดนี้ และสำรองไปยัง Cloud ทันที)?`)) {
+            restoreFromHistory(item);
+          }
+        });
+
+        el.cloudHistoryList.appendChild(row);
+      });
+    });
+  }
+
+  function restoreFromHistory(historyItem) {
+    if (!historyItem) return;
+    recordUndo('กู้คืนข้อมูลจากประวัติย้อนหลัง');
+    state.tasks = historyItem.tasks || {};
+    if (historyItem.labels) state.labels = historyItem.labels;
+    if (historyItem.holidays) state.holidays = historyItem.holidays;
+    if (historyItem.colorblindMode !== undefined) state.colorblindMode = historyItem.colorblindMode;
+
+    saveTasks();
+    saveLabels();
+    saveHolidays();
+    saveSettings();
+
+    pushToCloud(true); // บันทึกทันที
+
+    renderCalendar();
+    updateTagFilterSelect();
+    if (state.activeModalDate) renderDayTasks();
+
+    closeCloudSyncModal();
+    showToast('🎉 กู้คืนข้อมูลจากประวัติย้อนหลังเรียบร้อยแล้ว!');
+  }
+
   function listenToRemoteData(uid) {
     if (!state.firebaseDb) return;
 
@@ -634,34 +917,27 @@
         return;
       }
 
-      // Avoid looping if change came from local push
-      if (state.lastSyncTimestamp && val.updatedAt && Math.abs(val.updatedAt - state.lastSyncTimestamp.getTime()) < 2000) {
+      // Avoid looping if change came from our own local push
+      if (state.lastSyncTimestamp && val.updatedAt && Math.abs(val.updatedAt - state.lastSyncTimestamp.getTime()) < 3000) {
         return;
       }
 
-      state.isSyncingFromRemote = true;
-      try {
-        if (val.tasks) state.tasks = val.tasks;
-        if (val.labels) state.labels = val.labels;
-        if (val.holidays) state.holidays = val.holidays;
-        if (val.colorblindMode !== undefined) state.colorblindMode = val.colorblindMode;
+      const cloudTime = val.updatedAt || 0;
+      const localTime = state.localUpdatedAt || parseInt(localStorage.getItem('work_tracker_local_updated_at') || '0', 10);
+      const localStats = getTaskSummaryStats(state.tasks);
+      const isContentIdentical = JSON.stringify(state.tasks) === JSON.stringify(val.tasks || {});
 
-        localStorage.setItem('work_tracker_tasks', JSON.stringify(state.tasks));
-        localStorage.setItem('work_tracker_labels', JSON.stringify(state.labels));
-        localStorage.setItem('work_tracker_holidays', JSON.stringify(state.holidays || {}));
-        localStorage.setItem('work_tracker_colorblind', JSON.stringify(state.colorblindMode));
-
-        state.lastSyncTimestamp = new Date(val.updatedAt || Date.now());
-        updateSyncTimestampDisplay();
-
-        renderCalendar();
-        updateTagFilterSelect();
-        if (state.activeModalDate) renderDayTasks();
-
-        showToast('🔄 ซิงก์ข้อมูลงานล่าสุดเรียบร้อย');
-      } finally {
-        state.isSyncingFromRemote = false;
+      // ตรวจสอบความขัดแย้ง (Conflict Detection):
+      // หากข้อมูล Cloud อัปเดตใหม่กว่าในเครื่องเกิน 10 วินาที และในเครื่องนี้มีงานอยู่ และข้อมูลทั้ง 2 ฝั่งไม่ตรงกัน
+      const diffSeconds = Math.round((cloudTime - localTime) / 1000);
+      if (diffSeconds > 10 && localStats.total > 0 && !isContentIdentical && !isConflictModalOpen) {
+        console.warn(`[Sync Conflict] Cloud is newer by ${diffSeconds}s than local. Showing conflict prompt.`);
+        openSyncConflictModal(val, localTime);
+        return;
       }
+
+      applyRemoteData(val);
+      showToast('🔄 ซิงก์ข้อมูลงานล่าสุดเรียบร้อย');
     });
 
     remoteSyncUnsubscribe = () => dataRef.off('value');
@@ -670,17 +946,43 @@
   function pushToCloud(immediate = false) {
     if (state.isSyncingFromRemote || !state.cloudUser || !state.firebaseDb) return;
 
-    if (cloudPushTimeout) clearTimeout(cloudPushTimeout);
+    if (cloudPushTimeout) {
+      clearTimeout(cloudPushTimeout);
+      cloudPushTimeout = null;
+    }
+    if (cloudSyncCountdownTimer) {
+      clearInterval(cloudSyncCountdownTimer);
+      cloudSyncCountdownTimer = null;
+    }
 
     const doPush = () => {
+      if (cloudSyncCountdownTimer) {
+        clearInterval(cloudSyncCountdownTimer);
+        cloudSyncCountdownTimer = null;
+      }
       setCloudStatus('syncing');
       const uid = state.cloudUser.uid;
+      const now = Date.now();
+      const stats = getTaskSummaryStats(state.tasks);
+
       const payload = {
         tasks: state.tasks,
         labels: state.labels,
         holidays: state.holidays || {},
         colorblindMode: state.colorblindMode,
         updatedAt: firebase.database.ServerValue.TIMESTAMP
+      };
+
+      const historyEntry = {
+        savedAt: firebase.database.ServerValue.TIMESTAMP,
+        tasks: state.tasks,
+        labels: state.labels,
+        holidays: state.holidays || {},
+        colorblindMode: state.colorblindMode,
+        totalTasks: stats.total,
+        doneTasks: stats.done,
+        pendingTasks: stats.pending,
+        device: /Android|iPhone|iPad/i.test(navigator.userAgent) ? '📱 มือถือ' : '💻 คอมพิวเตอร์'
       };
 
       // Safety timeout: ถ้าผ่านไป 8 วินาทีแล้วฐานข้อมูลยังไม่ตอบสนอง ให้แจ้งเตือนเรื่อง databaseURL
@@ -698,6 +1000,10 @@
           setCloudStatus('online');
           state.lastSyncTimestamp = new Date();
           updateSyncTimestampDisplay();
+
+          // บันทึก History snapshot แยกไว้ต่างหาก
+          state.firebaseDb.ref('users/' + uid + '/history/' + now).set(historyEntry);
+          pruneCloudHistory(uid);
         })
         .catch((err) => {
           clearTimeout(timeoutId);
@@ -709,7 +1015,20 @@
     if (immediate) {
       doPush();
     } else {
-      cloudPushTimeout = setTimeout(doPush, 400);
+      cloudSyncSecondsRemaining = Math.round(CLOUD_SYNC_DEBOUNCE_MS / 1000);
+      setCloudStatus('pending', `มีข้อมูลใหม่ รอซิงก์ใน ${cloudSyncSecondsRemaining} วิ...`);
+
+      cloudSyncCountdownTimer = setInterval(() => {
+        cloudSyncSecondsRemaining--;
+        if (cloudSyncSecondsRemaining > 0) {
+          setCloudStatus('pending', `มีข้อมูลใหม่ รอซิงก์ใน ${cloudSyncSecondsRemaining} วิ...`);
+        } else {
+          clearInterval(cloudSyncCountdownTimer);
+          cloudSyncCountdownTimer = null;
+        }
+      }, 1000);
+
+      cloudPushTimeout = setTimeout(doPush, CLOUD_SYNC_DEBOUNCE_MS);
     }
   }
 
@@ -791,8 +1110,7 @@
     state.firebaseAuth.signInWithPopup(provider)
       .then((result) => {
         if (result.credential && result.credential.accessToken) {
-          state.googleAccessToken = result.credential.accessToken;
-          sessionStorage.setItem('work_tracker_gdrive_token', state.googleAccessToken);
+          saveGoogleDriveToken(result.credential.accessToken);
         }
         updateDriveStatusUI();
         if (uploadLocal) {
@@ -912,9 +1230,7 @@
   function handleLogoutCloud() {
     if (!state.firebaseAuth) return;
     state.firebaseAuth.signOut().then(() => {
-      state.googleAccessToken = null;
-      sessionStorage.removeItem('work_tracker_gdrive_token');
-      updateDriveStatusUI();
+      clearGoogleDriveToken();
       showToast('ออกจากระบบ Cloud แล้ว (กลับสู่โหมดในเครื่อง)');
     });
   }
@@ -2088,27 +2404,179 @@
     });
   }
 
+  function findExistingAttachmentAnywhere(fileName) {
+    if (!fileName || !state.tasks) return null;
+    for (const dateKey of Object.keys(state.tasks)) {
+      const dayTasks = state.tasks[dateKey];
+      if (Array.isArray(dayTasks)) {
+        for (const task of dayTasks) {
+          if (Array.isArray(task.attachments)) {
+            const found = task.attachments.find(a => a.name === fileName && a.uploadedToDrive && a.driveLink);
+            if (found) return found;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function syncAttachmentDriveStatus(att) {
+    if (!att) return;
+
+    // 1. ซิงก์ลงใน editingTaskAttachments (หากเปิดหน้าต่างแก้ไขงานอยู่)
+    if (state.editingTaskAttachments && Array.isArray(state.editingTaskAttachments)) {
+      state.editingTaskAttachments.forEach(a => {
+        if (a.id === att.id || a.name === att.name) {
+          a.uploadedToDrive = att.uploadedToDrive;
+          a.driveId = att.driveId || null;
+          a.driveLink = att.driveLink || null;
+          a.driveThumbnail = att.driveThumbnail || null;
+          a.isUploading = false;
+        }
+      });
+      renderEditTaskAttachments();
+    }
+
+    // 2. ซิงก์ลงใน newTaskAttachments (หากเปิดหน้าต่างเพิ่มงานอยู่)
+    if (state.newTaskAttachments && Array.isArray(state.newTaskAttachments)) {
+      state.newTaskAttachments.forEach(a => {
+        if (a.id === att.id || a.name === att.name) {
+          a.uploadedToDrive = att.uploadedToDrive;
+          a.driveId = att.driveId || null;
+          a.driveLink = att.driveLink || null;
+          a.driveThumbnail = att.driveThumbnail || null;
+          a.isUploading = false;
+        }
+      });
+      renderNewTaskAttachments();
+    }
+
+    // 3. ซิงก์ลงใน state.tasks ทุกวันและทุกงานที่มีไฟล์นี้
+    if (state.tasks) {
+      Object.keys(state.tasks).forEach(dateKey => {
+        const dayList = state.tasks[dateKey];
+        if (Array.isArray(dayList)) {
+          dayList.forEach(task => {
+            if (Array.isArray(task.attachments)) {
+              task.attachments.forEach(a => {
+                if (a.id === att.id || a.name === att.name) {
+                  a.uploadedToDrive = att.uploadedToDrive;
+                  a.driveId = att.driveId || null;
+                  a.driveLink = att.driveLink || null;
+                  a.driveThumbnail = att.driveThumbnail || null;
+                  a.isUploading = false;
+                }
+              });
+            }
+          });
+        }
+      });
+    }
+
+    // บันทึกลง Storage ทันที เพื่อป้องกันการรีเฟรชแล้วสถานะหาย
+    saveTasks();
+    renderDayTasks();
+    renderCalendar();
+  }
+
+  function saveGoogleDriveToken(token) {
+    state.googleAccessToken = token;
+    const expiresAt = Date.now() + (3500 * 1000); // 58 minutes
+    localStorage.setItem('work_tracker_gdrive_token', token);
+    localStorage.setItem('work_tracker_gdrive_token_exp', expiresAt.toString());
+    sessionStorage.setItem('work_tracker_gdrive_token', token);
+    updateDriveStatusUI();
+  }
+
+  function clearGoogleDriveToken() {
+    state.googleAccessToken = null;
+    localStorage.removeItem('work_tracker_gdrive_token');
+    localStorage.removeItem('work_tracker_gdrive_token_exp');
+    sessionStorage.removeItem('work_tracker_gdrive_token');
+    updateDriveStatusUI();
+  }
+
+  async function requestGoogleDriveToken() {
+    clearGoogleDriveToken();
+
+    if (!state.firebaseAuth) {
+      openCloudSyncModal();
+      showToast('⚠️ กรุณาเข้าสู่ระบบ Firebase เพื่อเปิดสิทธิ์เชื่อมต่อ Drive', 'warning');
+      return null;
+    }
+
+    const provider = new firebase.auth.GoogleAuthProvider();
+    provider.addScope('https://www.googleapis.com/auth/drive.file');
+    provider.setCustomParameters({ prompt: 'select_account' });
+
+    try {
+      showToast('🔑 กรุณาเลือกบัญชี Google ในหน้าต่างป๊อปอัปเพื่อเชื่อมต่อ Drive...', 'info');
+      const result = await state.firebaseAuth.signInWithPopup(provider);
+      if (result && result.credential && result.credential.accessToken) {
+        saveGoogleDriveToken(result.credential.accessToken);
+        showToast('🟢 เชื่อมต่อ Google Drive สำเร็จ!');
+        return result.credential.accessToken;
+      }
+    } catch (err) {
+      console.error('Google token request failed:', err);
+      showToast(`⚠️ ขอสิทธิ์ Google ไม่สำเร็จ: ${err.message}`, 'error');
+    }
+    return null;
+  }
+
   async function uploadFileToGoogleDrive(file, accessToken) {
-    if (!accessToken) throw new Error('No Google Access Token');
-    const folderId = GOOGLE_DRIVE_FOLDER_ID;
+    let token = accessToken || state.googleAccessToken;
+    if (!token) {
+      token = await requestGoogleDriveToken();
+      if (!token) throw new Error('No Google Access Token');
+    }
+    const folderId = (window.GOOGLE_DRIVE_FOLDER_ID || '').trim();
 
     const metadata = {
       name: file.name,
-      parents: [folderId],
       mimeType: file.type || 'application/octet-stream'
     };
+    if (folderId) {
+      metadata.parents = [folderId];
+    }
 
     const form = new FormData();
     form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
     form.append('file', file);
 
-    const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,webContentLink,thumbnailLink', {
+    let res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,webContentLink,thumbnailLink', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${accessToken}`
+        'Authorization': `Bearer ${token}`
       },
       body: form
     });
+
+    // หาก Token หมดอายุหรือไม่ถูกต้อง (401 Unauthorized) ให้ขอสิทธิ์ใหม่ทันทีแล้วลองอัปโหลดอีกครั้ง
+    if (res.status === 401) {
+      console.warn('Google Drive token expired (401), requesting fresh token and retrying...');
+      const freshToken = await requestGoogleDriveToken();
+      if (freshToken) {
+        return await uploadFileToGoogleDrive(file, freshToken);
+      }
+      throw new Error('สิทธิ์ Google Drive หมดอายุ กรุณาเข้าสู่ระบบใหม่อีกครั้ง');
+    }
+
+    // หากอัปโหลดไม่สำเร็จเนื่องจากโฟลเดอร์ ID ไม่ถูกต้อง (404/403) ให้ลองอัปโหลดไปยังหน้าแรก (My Drive) สำรองทันที
+    if (!res.ok && folderId) {
+      console.warn(`Drive upload to folder "${folderId}" failed with status ${res.status}, retrying upload to My Drive root...`);
+      delete metadata.parents;
+      const retryForm = new FormData();
+      retryForm.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+      retryForm.append('file', file);
+      res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,webContentLink,thumbnailLink', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
+        body: retryForm
+      });
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -2119,11 +2587,63 @@
     return driveFile;
   }
 
+  async function findExistingDriveFile(fileName, accessToken) {
+    if (!accessToken || !fileName) return null;
+    const folderId = (window.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+    const cleanName = fileName.replace(/'/g, "\\'");
+    let q = `name = '${cleanName}' and trashed = false`;
+    if (folderId) {
+      q = `'${folderId}' in parents and ${q}`;
+    }
+    const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,webViewLink,thumbnailLink,size)&pageSize=1`;
+
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`
+        }
+      });
+      if (res.status === 401) {
+        clearGoogleDriveToken();
+        return null;
+      }
+      if (!res.ok) {
+        // หากโฟลเดอร์ระบุไว้ไม่ถูกต้อง ให้ลองค้นหาทั่วทั้ง Google Drive
+        if (folderId) {
+          const fallbackUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`name = '${cleanName}' and trashed = false`)}&fields=files(id,name,webViewLink,thumbnailLink,size)&pageSize=1`;
+          const fallbackRes = await fetch(fallbackUrl, {
+            headers: { 'Authorization': `Bearer ${accessToken}` }
+          });
+          if (fallbackRes.ok) {
+            const fallbackData = await fallbackRes.json();
+            if (fallbackData.files && fallbackData.files.length > 0) return fallbackData.files[0];
+          }
+        }
+        return null;
+      }
+      const data = await res.json();
+      if (data.files && data.files.length > 0) {
+        return data.files[0];
+      }
+    } catch (e) {
+      console.warn('Check existing Drive file error', e);
+    }
+    return null;
+  }
+
   async function handleFilesSelected(files, targetArray, renderCallback) {
     if (!files || files.length === 0) return;
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
+
+      // 1. ตรวจสอบการแนบไฟล์ซ้ำในงานเดียวกัน
+      const existsInTask = targetArray.some(existing => existing.name === file.name);
+      if (existsInTask) {
+        showToast(`⚠️ ไฟล์ "${file.name}" มีอยู่ในรายการแล้ว (ข้ามการแนบซ้ำ)`, 'info');
+        continue;
+      }
+
       const attId = 'att-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4);
       const isImg = file.type && file.type.startsWith('image/');
 
@@ -2138,7 +2658,7 @@
         driveLink: null,
         driveThumbnail: null,
         uploadedToDrive: false,
-        isUploading: !!state.googleAccessToken
+        isUploading: false
       };
 
       targetArray.push(newAtt);
@@ -2159,16 +2679,40 @@
         console.warn('File read error', err);
       }
 
-      // Upload to Google Drive if access token available
-      if (state.googleAccessToken) {
+      // 2. ตรวจสอบว่าเคยมีไฟล์ชื่อนี้ในระบบที่เคยขึ้น Drive แล้วหรือไม่
+      const localMatch = findExistingAttachmentAnywhere(file.name);
+      if (localMatch && localMatch.driveLink) {
+        newAtt.driveId = localMatch.driveId || null;
+        newAtt.driveLink = localMatch.driveLink || null;
+        newAtt.driveThumbnail = localMatch.driveThumbnail || null;
+        newAtt.uploadedToDrive = true;
+        newAtt.isUploading = false;
+        showToast(`☁️ พบไฟล์ "${file.name}" เคยขึ้น Google Drive แล้ว (เชื่อมโยงทันที ไม่ต้องอัปโหลดซ้ำ)`);
+        syncAttachmentDriveStatus(newAtt);
+      } else if (state.googleAccessToken) {
+        newAtt.isUploading = true;
+        if (renderCallback) renderCallback();
+
         try {
-          const driveData = await uploadFileToGoogleDrive(file, state.googleAccessToken);
-          newAtt.driveId = driveData.id;
-          newAtt.driveLink = driveData.webViewLink;
-          newAtt.driveThumbnail = driveData.thumbnailLink;
-          newAtt.uploadedToDrive = true;
-          newAtt.isUploading = false;
-          showToast(`☁️ อัปโหลด "${file.name}" ขึ้น Google Drive เรียบร้อย`);
+          const existingDriveFile = await findExistingDriveFile(file.name, state.googleAccessToken);
+          if (existingDriveFile) {
+            newAtt.driveId = existingDriveFile.id || null;
+            newAtt.driveLink = existingDriveFile.webViewLink || null;
+            newAtt.driveThumbnail = existingDriveFile.thumbnailLink || null;
+            newAtt.uploadedToDrive = true;
+            newAtt.isUploading = false;
+            showToast(`☁️ พบไฟล์ "${file.name}" บน Google Drive แล้ว (เชื่อมโยงทันที ไม่ต้องอัปโหลดซ้ำ)`);
+            syncAttachmentDriveStatus(newAtt);
+          } else {
+            const driveData = await uploadFileToGoogleDrive(file, state.googleAccessToken);
+            newAtt.driveId = driveData.id || null;
+            newAtt.driveLink = driveData.webViewLink || null;
+            newAtt.driveThumbnail = driveData.thumbnailLink || null;
+            newAtt.uploadedToDrive = true;
+            newAtt.isUploading = false;
+            showToast(`🎉 อัปโหลด "${file.name}" ขึ้น Google Drive เรียบร้อย!`);
+            syncAttachmentDriveStatus(newAtt);
+          }
         } catch (driveErr) {
           console.warn('Google Drive upload failed, file stored locally', driveErr);
           newAtt.isUploading = false;
@@ -2408,15 +2952,10 @@
   }
 
   async function uploadExistingAttachmentToDrive(att, renderCallback) {
-    if (!state.googleAccessToken) {
-      if (state.firebaseAuth) {
-        showToast('กรุณาเข้าสู่ระบบ Google เพื่อเปิดสิทธิ์บันทึกไฟล์ลง Drive...', 'info');
-        handleGoogleSignIn();
-      } else {
-        openCloudSyncModal();
-        showToast('⚠️ กรุณาเข้าสู่ระบบ Firebase/Google ก่อนอัปโหลดขึ้น Drive', 'warning');
-      }
-      return;
+    let token = state.googleAccessToken;
+    if (!token) {
+      token = await requestGoogleDriveToken();
+      if (!token) return;
     }
 
     let fileData = att.dataUrl;
@@ -2434,17 +2973,43 @@
     showToast(`☁️ กำลังอัปโหลด "${att.name}" ขึ้น Google Drive...`, 'info');
 
     try {
+      // 1. ตรวจสอบก่อนว่าเคยมีไฟล์ชื่อนี้ในระบบที่ขึ้น Drive แล้วหรือไม่
+      const localMatch = findExistingAttachmentAnywhere(att.name);
+      if (localMatch && localMatch.driveLink) {
+        att.driveId = localMatch.driveId || null;
+        att.driveLink = localMatch.driveLink || null;
+        att.driveThumbnail = localMatch.driveThumbnail || null;
+        att.uploadedToDrive = true;
+        att.isUploading = false;
+        syncAttachmentDriveStatus(att);
+        if (renderCallback) renderCallback();
+        showToast(`☁️ พบไฟล์ "${att.name}" บน Google Drive แล้ว (เชื่อมโยงให้อัตโนมัติ ไม่เปลืองพื้นที่ซ้ำ)`);
+        return;
+      }
+
+      // 2. ตรวจสอบบน Google Drive API ว่ามีไฟล์นี้อยู่แล้วหรือไม่ เพื่อป้องกันการอัปโหลดซ้ำ
+      const existing = await findExistingDriveFile(att.name, state.googleAccessToken);
+      if (existing) {
+        att.driveId = existing.id || null;
+        att.driveLink = existing.webViewLink || null;
+        att.driveThumbnail = existing.thumbnailLink || null;
+        att.uploadedToDrive = true;
+        att.isUploading = false;
+        syncAttachmentDriveStatus(att);
+        if (renderCallback) renderCallback();
+        showToast(`☁️ พบไฟล์ "${att.name}" บน Google Drive แล้ว (เชื่อมโยงให้อัตโนมัติ ไม่เปลืองพื้นที่ซ้ำ)`);
+        return;
+      }
+
       const blob = dataUrlToBlob(fileData);
       const fileObj = new File([blob], att.name, { type: att.type });
       const driveData = await uploadFileToGoogleDrive(fileObj, state.googleAccessToken);
-      att.driveId = driveData.id;
-      att.driveLink = driveData.webViewLink;
-      att.driveThumbnail = driveData.thumbnailLink;
+      att.driveId = driveData.id || null;
+      att.driveLink = driveData.webViewLink || null;
+      att.driveThumbnail = driveData.thumbnailLink || null;
       att.uploadedToDrive = true;
       att.isUploading = false;
-      saveTasks();
-      renderDayTasks();
-      renderCalendar();
+      syncAttachmentDriveStatus(att);
       if (renderCallback) renderCallback();
       showToast(`🎉 อัปโหลด "${att.name}" ขึ้น Google Drive สำเร็จ!`);
     } catch (err) {
@@ -2930,22 +3495,83 @@
     if (el.tabBtnAccount) {
       el.tabBtnAccount.addEventListener('click', () => {
         el.tabBtnAccount.classList.add('active');
-        el.tabBtnConfig.classList.remove('active');
-        el.panelAccount.style.display = 'block';
-        el.panelConfig.style.display = 'none';
+        if (el.tabBtnConfig) el.tabBtnConfig.classList.remove('active');
+        if (el.tabBtnHistory) el.tabBtnHistory.classList.remove('active');
+        if (el.panelAccount) el.panelAccount.style.display = 'block';
+        if (el.panelConfig) el.panelConfig.style.display = 'none';
+        if (el.panelHistory) el.panelHistory.style.display = 'none';
       });
     }
     if (el.tabBtnConfig) {
       el.tabBtnConfig.addEventListener('click', () => {
         el.tabBtnConfig.classList.add('active');
-        el.tabBtnAccount.classList.remove('active');
-        el.panelConfig.style.display = 'block';
-        el.panelAccount.style.display = 'none';
+        if (el.tabBtnAccount) el.tabBtnAccount.classList.remove('active');
+        if (el.tabBtnHistory) el.tabBtnHistory.classList.remove('active');
+        if (el.panelConfig) el.panelConfig.style.display = 'block';
+        if (el.panelAccount) el.panelAccount.style.display = 'none';
+        if (el.panelHistory) el.panelHistory.style.display = 'none';
         const cfg = getStoredFirebaseConfig();
         if (cfg && el.firebaseConfigTextarea) {
           el.firebaseConfigTextarea.value = JSON.stringify(cfg, null, 2);
         }
       });
+    }
+    if (el.tabBtnHistory) {
+      el.tabBtnHistory.addEventListener('click', () => {
+        el.tabBtnHistory.classList.add('active');
+        if (el.tabBtnAccount) el.tabBtnAccount.classList.remove('active');
+        if (el.tabBtnConfig) el.tabBtnConfig.classList.remove('active');
+        if (el.panelHistory) el.panelHistory.style.display = 'block';
+        if (el.panelAccount) el.panelAccount.style.display = 'none';
+        if (el.panelConfig) el.panelConfig.style.display = 'none';
+        loadCloudHistory();
+      });
+    }
+    if (el.btnRefreshHistory) {
+      el.btnRefreshHistory.addEventListener('click', loadCloudHistory);
+    }
+
+    // Conflict Modal controls
+    if (el.btnConflictUseCloud) {
+      el.btnConflictUseCloud.addEventListener('click', () => {
+        if (pendingConflictCloudData) {
+          applyRemoteData(pendingConflictCloudData);
+          showToast('☁️ นำข้อมูลล่าสุดจาก Cloud มาใช้งานแล้ว');
+        }
+        closeSyncConflictModal();
+      });
+    }
+    if (el.btnConflictMerge) {
+      el.btnConflictMerge.addEventListener('click', () => {
+        if (pendingConflictCloudData) {
+          const mergedTasks = mergeTasksData(state.tasks, pendingConflictCloudData.tasks || {});
+          state.tasks = mergedTasks;
+          if (pendingConflictCloudData.labels) {
+            Object.keys(pendingConflictCloudData.labels).forEach(lblId => {
+              if (!state.labels[lblId]) {
+                state.labels[lblId] = pendingConflictCloudData.labels[lblId];
+              }
+            });
+          }
+          saveTasks();
+          saveLabels();
+          renderCalendar();
+          if (state.activeModalDate) renderDayTasks();
+          pushToCloud(true);
+          showToast('🔄 รวมข้อมูลทั้งสองฝั่ง (Merge) สำเร็จเรียบร้อย');
+        }
+        closeSyncConflictModal();
+      });
+    }
+    if (el.btnConflictUseLocal) {
+      el.btnConflictUseLocal.addEventListener('click', () => {
+        closeSyncConflictModal();
+        pushToCloud(true);
+        showToast('💻 บันทึกข้อมูลของเครื่องนี้ขึ้น Cloud แล้ว');
+      });
+    }
+    if (el.btnCloseConflictModal) {
+      el.btnCloseConflictModal.addEventListener('click', closeSyncConflictModal);
     }
 
     if (el.btnModePIN) el.btnModePIN.addEventListener('click', () => setAuthMode('pin'));
@@ -3016,6 +3642,16 @@
       if (e.target === el.backupModal) el.backupModal.classList.remove('active');
       if (e.target === el.dragDropActionModal) closeDragDropModal();
       if (e.target === el.cloudSyncModal) closeCloudSyncModal();
+      if (e.target === el.syncConflictModal) closeSyncConflictModal();
+    });
+
+    // Save pending debounce sync before leaving/closing tab
+    window.addEventListener('beforeunload', () => {
+      if (cloudSyncTimer) {
+        clearTimeout(cloudSyncTimer);
+        cloudSyncTimer = null;
+        pushToCloud(true);
+      }
     });
 
     // Keyboard shortcuts (Escape to close, Ctrl+Z to Undo)
@@ -3046,6 +3682,7 @@
         else if (el.backupModal && el.backupModal.classList.contains('active')) el.backupModal.classList.remove('active');
         else if (el.dragDropActionModal && el.dragDropActionModal.classList.contains('active')) closeDragDropModal();
         else if (el.cloudSyncModal && el.cloudSyncModal.classList.contains('active')) closeCloudSyncModal();
+        else if (el.syncConflictModal && el.syncConflictModal.classList.contains('active')) closeSyncConflictModal();
       }
     });
   }

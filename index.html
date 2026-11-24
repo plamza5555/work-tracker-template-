@@ -465,6 +465,7 @@
         <!-- Sync Nav Tabs -->
         <div class="sync-tab-nav">
           <button type="button" class="btn-sync-tab active" id="tabBtnAccount">🔑 เข้าสู่ระบบ / ซิงก์งาน</button>
+          <button type="button" class="btn-sync-tab" id="tabBtnHistory">⏱️ ประวัติย้อนหลัง (History)</button>
           <button type="button" class="btn-sync-tab" id="tabBtnConfig">⚙️ ตั้งค่า Firebase</button>
         </div>
 
@@ -597,6 +598,78 @@
           </div>
         </div>
 
+        <!-- Panel 3: Cloud History Snapshots -->
+        <div id="panelHistory" class="sync-panel" style="display: none;">
+          <div style="margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
+            <h4 style="font-size: 0.92rem;">⏱️ ประวัติการบันทึกย้อนหลังบน Cloud</h4>
+            <button type="button" id="btnRefreshHistory" class="btn btn-secondary btn-sm" style="font-size: 0.75rem; padding: 3px 8px;">🔄 รีเฟรช</button>
+          </div>
+          <p style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 12px; line-height: 1.4;">
+            ระบบสำรองประวัติทุกครั้งที่มีการซิงก์งาน คุณสามารถกู้คืนข้อมูลจากช่วงเวลาก่อนหน้าได้ตลอดเวลา (เก็บย้อนหลัง 20 รายการ)
+          </p>
+          <div id="cloudHistoryList" class="cloud-history-list">
+            <div style="text-align: center; color: var(--text-muted); font-size: 0.82rem; padding: 20px;">
+              กรุณาเข้าสู่ระบบ Cloud เพื่อดูประวัติย้อนหลัง
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- Sync Conflict Modal -->
+  <div id="syncConflictModal" class="modal-backdrop">
+    <div class="modal-box modal-md">
+      <div class="modal-header" style="border-bottom-color: rgba(234, 179, 8, 0.3);">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="font-size: 1.4rem;">⚠️</span>
+          <h3 style="color: #fbbf24;">พบข้อมูลบน Cloud อัปเดตใหม่กว่า</h3>
+        </div>
+        <button class="modal-close-btn" id="btnCloseConflictModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.88rem; color: var(--text-secondary); margin-bottom: 14px; line-height: 1.5;">
+          ข้อมูลบน Cloud มีการอัปเดตใหม่กว่าในเครื่องนี้ (อาจถูกแก้ไขจากมือถือหรืออุปกรณ์อื่น) เพื่อป้องกันไม่ให้ข้อมูลล่าสุดถูกเซฟทับ กรุณาเลือกวิธีจัดการข้อมูล:
+        </p>
+
+        <div class="conflict-comparison-grid">
+          <!-- Cloud Data Card -->
+          <div class="conflict-card conflict-cloud">
+            <div class="conflict-card-header">
+              <span class="conflict-card-badge cloud">☁️ ข้อมูลบน Cloud (ล่าสุด)</span>
+              <span class="conflict-recommend-tag">แนะนำ</span>
+            </div>
+            <div class="conflict-card-body">
+              <div class="conflict-time" id="conflictCloudTime">กำลังตรวจสอบ...</div>
+              <div class="conflict-stats" id="conflictCloudStats">กำลังโหลด...</div>
+            </div>
+          </div>
+
+          <!-- Local Data Card -->
+          <div class="conflict-card conflict-local">
+            <div class="conflict-card-header">
+              <span class="conflict-card-badge local">💻 ข้อมูลในเครื่องนี้</span>
+              <span class="conflict-stale-tag" id="conflictLocalDiffTag">เก่ากว่า</span>
+            </div>
+            <div class="conflict-card-body">
+              <div class="conflict-time" id="conflictLocalTime">กำลังตรวจสอบ...</div>
+              <div class="conflict-stats" id="conflictLocalStats">กำลังโหลด...</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="conflict-actions">
+          <button type="button" id="btnConflictUseCloud" class="btn btn-primary btn-block" style="background-color: #2563eb;">
+            ☁️ ใช้ข้อมูลจาก Cloud (แนะนำ - นำข้อมูลใหม่มาแทนที่)
+          </button>
+          <button type="button" id="btnConflictMerge" class="btn btn-secondary btn-block" style="border-color: #3b82f6; color: #60a5fa;">
+            🔄 รวมข้อมูลทั้ง 2 ฝั่งเข้าด้วยกัน (Merge ทั้งหมด)
+          </button>
+          <button type="button" id="btnConflictUseLocal" class="btn btn-outline btn-block" style="color: #94a3b8; font-size: 0.82rem; border-color: rgba(148, 163, 184, 0.3);">
+            💻 บันทึกข้อมูลเครื่องนี้ขึ้นไปทับบน Cloud
+          </button>
+        </div>
       </div>
     </div>
   </div>
