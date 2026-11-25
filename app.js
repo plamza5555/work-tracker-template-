@@ -60,6 +60,7 @@
     dayTaskFilter: 'all', // 'all', 'pending', 'done'
     tagFilter: 'all', // 'all' or labelId
     colorblindMode: true,
+    dedupMonthlyTasks: true,
     theme: 'dark',
     
     // Label popover context
@@ -84,7 +85,10 @@
     undoStack: [],
     newTaskAttachments: [],
     editingTaskAttachments: [],
-    googleAccessToken: getValidGoogleToken()
+    googleAccessToken: getValidGoogleToken(),
+    bgSettings: {
+      months: {}
+    }
   };
 
   function getValidGoogleToken() {
@@ -121,11 +125,35 @@
       const savedColorblind = localStorage.getItem('work_tracker_colorblind');
       state.colorblindMode = savedColorblind !== null ? JSON.parse(savedColorblind) : true;
 
+      const savedDedup = localStorage.getItem('work_tracker_dedup_monthly');
+      state.dedupMonthlyTasks = savedDedup !== null ? JSON.parse(savedDedup) : true;
+
       const savedHolidays = localStorage.getItem('work_tracker_holidays');
       state.holidays = savedHolidays ? JSON.parse(savedHolidays) : {};
 
       const savedTheme = localStorage.getItem('work_tracker_theme');
       state.theme = savedTheme || 'dark';
+
+      const savedBg = localStorage.getItem('work_tracker_bg_settings');
+      if (savedBg) {
+        const parsedBg = JSON.parse(savedBg);
+        if (parsedBg && parsedBg.months) {
+          state.bgSettings = parsedBg;
+        } else if (parsedBg && parsedBg.hasImage !== undefined) {
+          // Migrate legacy global bg setting to current month
+          const curKey = `${state.viewYear}-${String(state.viewMonth + 1).padStart(2, '0')}`;
+          state.bgSettings = { months: {} };
+          if (parsedBg.hasImage) {
+            state.bgSettings.months[curKey] = {
+              hasImage: true,
+              legacyKey: true,
+              overlayOpacity: parsedBg.overlayOpacity ?? 40,
+              blur: parsedBg.blur ?? 0,
+              cardOpacity: parsedBg.cardOpacity ?? 78
+            };
+          }
+        }
+      }
     } catch (e) {
       console.warn('Could not load storage, using default values', e);
       state.labels = DEFAULT_LABELS;
@@ -239,6 +267,7 @@
   function saveSettings() {
     updateLocalTimestamp();
     localStorage.setItem('work_tracker_colorblind', JSON.stringify(state.colorblindMode));
+    localStorage.setItem('work_tracker_dedup_monthly', JSON.stringify(state.dedupMonthlyTasks));
     localStorage.setItem('work_tracker_theme', state.theme);
     pushToCloud();
   }
@@ -288,10 +317,12 @@
 
     // Month Stats
     statMonthTotal: document.getElementById('statMonthTotal'),
+    statMonthRawHint: document.getElementById('statMonthRawHint'),
     statMonthDone: document.getElementById('statMonthDone'),
     statMonthPending: document.getElementById('statMonthPending'),
     statProgressBar: document.getElementById('statProgressBar'),
     statProgressPercent: document.getElementById('statProgressPercent'),
+    btnToggleDedupMonthly: document.getElementById('btnToggleDedupMonthly'),
 
     // Day Modal
     dayModal: document.getElementById('dayModal'),
@@ -301,6 +332,7 @@
     addTaskForm: document.getElementById('addTaskForm'),
     taskTitleInput: document.getElementById('taskTitleInput'),
     taskDescInput: document.getElementById('taskDescInput'),
+    taskSheetUrlInput: document.getElementById('taskSheetUrlInput'),
     btnOpenNewTaskLabels: document.getElementById('btnOpenNewTaskLabels'),
     newTaskSelectedTagsPills: document.getElementById('newTaskSelectedTagsPills'),
     dayTaskList: document.getElementById('dayTaskList'),
@@ -319,6 +351,8 @@
     editTaskDate: document.getElementById('editTaskDate'),
     editTaskTitle: document.getElementById('editTaskTitle'),
     editTaskDesc: document.getElementById('editTaskDesc'),
+    editTaskSheetUrl: document.getElementById('editTaskSheetUrl'),
+    btnOpenEditSheetUrl: document.getElementById('btnOpenEditSheetUrl'),
 
     // Trello Label Picker Modal
     labelPickerModal: document.getElementById('labelPickerModal'),
@@ -341,6 +375,7 @@
     customColorHex: document.getElementById('customColorHex'),
     labelLivePreview: document.getElementById('labelLivePreview'),
     previewLabelText: document.getElementById('previewLabelText'),
+    labelCountOnceMonthly: document.getElementById('labelCountOnceMonthly'),
     btnSaveLabel: document.getElementById('btnSaveLabel'),
     btnDeleteLabel: document.getElementById('btnDeleteLabel'),
 
@@ -355,6 +390,27 @@
     btnThemeToggle: document.getElementById('btnThemeToggle'),
     themeIcon: document.getElementById('themeIcon'),
     toastContainer: document.getElementById('toastContainer'),
+
+    // Custom Background Settings Elements
+    customBgLayer: document.getElementById('customBgLayer'),
+    customBgOverlay: document.getElementById('customBgOverlay'),
+    btnBgSettings: document.getElementById('btnBgSettings'),
+    bgSettingsModal: document.getElementById('bgSettingsModal'),
+    btnCloseBgModal: document.getElementById('btnCloseBgModal'),
+    btnBgPrevMonth: document.getElementById('btnBgPrevMonth'),
+    btnBgNextMonth: document.getElementById('btnBgNextMonth'),
+    bgModalMonthName: document.getElementById('bgModalMonthName'),
+    bgPreviewBox: document.getElementById('bgPreviewBox'),
+    bgImageInput: document.getElementById('bgImageInput'),
+    btnUploadBgImage: document.getElementById('btnUploadBgImage'),
+    btnResetBgImage: document.getElementById('btnResetBgImage'),
+    bgSlidersSection: document.getElementById('bgSlidersSection'),
+    bgOverlayRange: document.getElementById('bgOverlayRange'),
+    bgOverlayValue: document.getElementById('bgOverlayValue'),
+    bgBlurRange: document.getElementById('bgBlurRange'),
+    bgBlurValue: document.getElementById('bgBlurValue'),
+    bgCardOpacityRange: document.getElementById('bgCardOpacityRange'),
+    bgCardOpacityValue: document.getElementById('bgCardOpacityValue'),
 
     // Drag & Drop Task Across Days Modal
     dragDropActionModal: document.getElementById('dragDropActionModal'),
@@ -486,6 +542,211 @@
     saveSettings();
     applyTheme();
     showToast(`เปลี่ยนเป็นโหมด ${state.theme === 'dark' ? 'มืด (Dark)' : 'สว่าง (Light)'}`);
+  }
+
+  // --- Custom Background Wallpaper Management (Per-Month) ---
+  const BG_IMAGE_IDB_PREFIX = '__custom_bg_image__';
+
+  function getCurrentBgMonthKey() {
+    return `${state.viewYear}-${String(state.viewMonth + 1).padStart(2, '0')}`;
+  }
+
+  function getMonthBgIdbKey(monthKey, legacy = false) {
+    return legacy ? BG_IMAGE_IDB_PREFIX : `${BG_IMAGE_IDB_PREFIX}_${monthKey}`;
+  }
+
+  function getMonthBgConfig(monthKey) {
+    if (!state.bgSettings || !state.bgSettings.months) {
+      state.bgSettings = { months: {} };
+    }
+    if (!state.bgSettings.months[monthKey]) {
+      state.bgSettings.months[monthKey] = {
+        hasImage: false,
+        overlayOpacity: 40,
+        blur: 0,
+        cardOpacity: 78
+      };
+    }
+    return state.bgSettings.months[monthKey];
+  }
+
+  function saveBgSettings() {
+    try {
+      localStorage.setItem('work_tracker_bg_settings', JSON.stringify(state.bgSettings));
+    } catch (e) {
+      console.warn('Could not save bg settings:', e);
+    }
+  }
+
+  function applyCustomBackgroundStyles(dataUrl, monthKey) {
+    const activeKey = monthKey || getCurrentBgMonthKey();
+    const cfg = getMonthBgConfig(activeKey);
+
+    if (el.bgModalMonthName) {
+      el.bgModalMonthName.textContent = `${THAI_MONTHS[state.viewMonth]} ${state.viewYear}`;
+    }
+
+    if (dataUrl && cfg.hasImage) {
+      document.body.classList.add('has-custom-bg');
+      if (el.customBgLayer) {
+        el.customBgLayer.style.backgroundImage = `url("${dataUrl}")`;
+        el.customBgLayer.style.filter = `blur(${cfg.blur}px)`;
+        el.customBgLayer.style.display = 'block';
+      }
+      if (el.customBgOverlay) {
+        el.customBgOverlay.style.backgroundColor = `rgba(0, 0, 0, ${cfg.overlayOpacity / 100})`;
+        el.customBgOverlay.style.display = 'block';
+      }
+      const alpha = Math.max(0.3, Math.min(1, cfg.cardOpacity / 100));
+      const hoverAlpha = Math.min(1, alpha + 0.1);
+      document.documentElement.style.setProperty('--bg-card-alpha', alpha.toFixed(2));
+      document.documentElement.style.setProperty('--bg-card-hover-alpha', hoverAlpha.toFixed(2));
+
+      if (el.bgPreviewBox) {
+        el.bgPreviewBox.style.backgroundImage = `url("${dataUrl}")`;
+        el.bgPreviewBox.classList.add('has-image');
+        el.bgPreviewBox.innerHTML = '';
+      }
+      if (el.btnResetBgImage) el.btnResetBgImage.style.display = 'inline-flex';
+      if (el.bgSlidersSection) el.bgSlidersSection.style.display = 'flex';
+    } else {
+      document.body.classList.remove('has-custom-bg');
+      if (el.customBgLayer) {
+        el.customBgLayer.style.display = 'none';
+        el.customBgLayer.style.backgroundImage = '';
+      }
+      if (el.customBgOverlay) {
+        el.customBgOverlay.style.display = 'none';
+      }
+      if (el.bgPreviewBox) {
+        el.bgPreviewBox.style.backgroundImage = '';
+        el.bgPreviewBox.classList.remove('has-image');
+        el.bgPreviewBox.innerHTML = `
+          <div class="bg-preview-empty">
+            <span style="font-size: 2rem;">🌄</span>
+            <span>ยังไม่ได้ตั้งภาพพื้นหลังสำหรับ ${THAI_MONTHS[state.viewMonth]} ${state.viewYear}</span>
+          </div>
+        `;
+      }
+      if (el.btnResetBgImage) el.btnResetBgImage.style.display = 'none';
+      if (el.bgSlidersSection) el.bgSlidersSection.style.display = 'none';
+    }
+
+    // Sync slider UI values
+    if (el.bgOverlayRange) el.bgOverlayRange.value = cfg.overlayOpacity;
+    if (el.bgOverlayValue) el.bgOverlayValue.textContent = `${cfg.overlayOpacity}%`;
+    if (el.bgBlurRange) el.bgBlurRange.value = cfg.blur;
+    if (el.bgBlurValue) el.bgBlurValue.textContent = `${cfg.blur} px`;
+    if (el.bgCardOpacityRange) el.bgCardOpacityRange.value = cfg.cardOpacity;
+    if (el.bgCardOpacityValue) el.bgCardOpacityValue.textContent = `${cfg.cardOpacity}%`;
+  }
+
+  async function loadAndApplyCustomBackground() {
+    const monthKey = getCurrentBgMonthKey();
+    const cfg = getMonthBgConfig(monthKey);
+
+    if (!cfg || !cfg.hasImage) {
+      applyCustomBackgroundStyles(null, monthKey);
+      return;
+    }
+
+    let dataUrl = await getFileFromIndexedDB(getMonthBgIdbKey(monthKey, false));
+    if (!dataUrl && cfg.legacyKey) {
+      dataUrl = await getFileFromIndexedDB(getMonthBgIdbKey(monthKey, true));
+      if (dataUrl) {
+        await saveFileToIndexedDB(getMonthBgIdbKey(monthKey, false), dataUrl);
+        delete cfg.legacyKey;
+        saveBgSettings();
+      }
+    }
+
+    // Check if user already navigated to another month while async DB read was running
+    if (monthKey !== getCurrentBgMonthKey()) return;
+
+    if (dataUrl) {
+      applyCustomBackgroundStyles(dataUrl, monthKey);
+    } else {
+      cfg.hasImage = false;
+      saveBgSettings();
+      applyCustomBackgroundStyles(null, monthKey);
+    }
+  }
+
+  function resizeBgImageIfNeeded(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('ไม่สามารถอ่านไฟล์รูปภาพได้'));
+      reader.onload = (e) => {
+        const rawDataUrl = e.target.result;
+        const img = new Image();
+        img.onerror = () => reject(new Error('ไฟล์ที่เลือกไม่ใช่รูปภาพที่รองรับ'));
+        img.onload = () => {
+          const MAX_DIM = 1920;
+          let { width, height } = img;
+          if (width <= MAX_DIM && height <= MAX_DIM && file.size <= 1500000) {
+            resolve(rawDataUrl);
+            return;
+          }
+          const ratio = Math.min(MAX_DIM / width, MAX_DIM / height, 1);
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(width * ratio);
+          canvas.height = Math.round(height * ratio);
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/jpeg', 0.86));
+        };
+        img.src = rawDataUrl;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function handleBgImageUpload(file) {
+    if (!file || !file.type.startsWith('image/')) {
+      showToast('⚠️ กรุณาเลือกไฟล์รูปภาพ (.jpg, .png, .webp)', 'warning');
+      return;
+    }
+    const monthKey = getCurrentBgMonthKey();
+    try {
+      showToast(`🖼️ กำลังบันทึกภาพพื้นหลังสำหรับ ${THAI_MONTHS[state.viewMonth]} ${state.viewYear}...`);
+      const dataUrl = await resizeBgImageIfNeeded(file);
+      await saveFileToIndexedDB(getMonthBgIdbKey(monthKey, false), dataUrl);
+      const cfg = getMonthBgConfig(monthKey);
+      cfg.hasImage = true;
+      delete cfg.legacyKey;
+      saveBgSettings();
+      applyCustomBackgroundStyles(dataUrl, monthKey);
+      showToast(`✨ เปลี่ยนภาพพื้นหลังเดือน ${THAI_MONTHS[state.viewMonth]} เรียบร้อย!`);
+    } catch (err) {
+      showToast('⚠️ ' + err.message, 'error');
+    }
+  }
+
+  async function resetCustomBackground() {
+    const monthKey = getCurrentBgMonthKey();
+    const cfg = getMonthBgConfig(monthKey);
+    cfg.hasImage = false;
+    saveBgSettings();
+    try {
+      const db = await openFilesDB();
+      if (db) {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).delete(getMonthBgIdbKey(monthKey, false));
+      }
+    } catch (e) {
+      console.warn('Error removing bg from IDB:', e);
+    }
+    applyCustomBackgroundStyles(null, monthKey);
+    showToast(`🗑️ ลบภาพพื้นหลังเดือน ${THAI_MONTHS[state.viewMonth]} แล้ว`);
+  }
+
+  function openBgSettingsModal() {
+    loadAndApplyCustomBackground();
+    if (el.bgSettingsModal) el.bgSettingsModal.classList.add('active');
+  }
+
+  function closeBgSettingsModal() {
+    if (el.bgSettingsModal) el.bgSettingsModal.classList.remove('active');
   }
 
   // ============================================================
@@ -1301,6 +1562,9 @@
     // Update Filter Select Options
     updateTagFilterSelect();
 
+    // Update Custom Background for the viewed month
+    loadAndApplyCustomBackground();
+
     // Clear calendar grid
     el.calendarGrid.innerHTML = '';
 
@@ -1310,8 +1574,11 @@
 
     const todayKey = formatDateKey(new Date());
 
-    let monthTotalTasks = 0;
-    let monthDoneTasks = 0;
+    let rawTotalTasks = 0;
+    const monthlyJobMap = new Map(); // Key -> { done: boolean }
+    const countOnceLabelIds = new Set(
+      state.labels.filter(l => l.countOnceMonthly).map(l => l.id)
+    );
 
     // Previous month filler days
     for (let i = firstDayOfMonth - 1; i >= 0; i--) {
@@ -1320,21 +1587,36 @@
       el.calendarGrid.appendChild(cell);
     }
 
-    // Current month days
+    // Current month days (chronological order so later days update continuous job status)
     for (let day = 1; day <= daysInMonth; day++) {
       const date = new Date(year, month, day);
       const dateKey = formatDateKey(date);
       const tasks = state.tasks[dateKey] || [];
 
-      // Check stats
       tasks.forEach(t => {
-        monthTotalTasks++;
-        if (t.done) monthDoneTasks++;
+        rawTotalTasks++;
+        const matchedOnceTagId = (t.tags || []).find(tid => countOnceLabelIds.has(tid));
+        let groupKey;
+        if (matchedOnceTagId) {
+          groupKey = `tag:${matchedOnceTagId}`;
+        } else if (state.dedupMonthlyTasks && t.title && t.title.trim()) {
+          groupKey = `title:${t.title.trim().toLowerCase()}`;
+        } else {
+          groupKey = `task:${dateKey}:${t.id}`;
+        }
+        // Later day's status in the month reflects latest progress of the continuous task
+        monthlyJobMap.set(groupKey, { done: !!t.done });
       });
 
       const cell = createDayCell(date, false, todayKey);
       el.calendarGrid.appendChild(cell);
     }
+
+    let monthTotalTasks = monthlyJobMap.size;
+    let monthDoneTasks = 0;
+    monthlyJobMap.forEach(job => {
+      if (job.done) monthDoneTasks++;
+    });
 
     // Next month filler days (fill out remaining grid up to 35 or 42 cells)
     const totalRendered = firstDayOfMonth + daysInMonth;
@@ -1350,6 +1632,23 @@
     const percent = monthTotalTasks > 0 ? Math.round((monthDoneTasks / monthTotalTasks) * 100) : 0;
 
     el.statMonthTotal.textContent = monthTotalTasks;
+    if (el.statMonthRawHint) {
+      if (rawTotalTasks > monthTotalTasks) {
+        el.statMonthRawHint.textContent = `(จาก ${rawTotalTasks} รายการรายวัน)`;
+        el.statMonthRawHint.style.display = 'inline';
+      } else {
+        el.statMonthRawHint.style.display = 'none';
+      }
+    }
+    if (el.btnToggleDedupMonthly) {
+      el.btnToggleDedupMonthly.classList.toggle('active', !!state.dedupMonthlyTasks);
+      const span = el.btnToggleDedupMonthly.querySelector('span');
+      if (span) {
+        span.textContent = state.dedupMonthlyTasks
+          ? '🔁 นับงานต่อเนื่องเป็น 1 งาน: เปิด'
+          : '🔁 นับงานต่อเนื่องเป็น 1 งาน: ปิด';
+      }
+    }
     el.statMonthDone.textContent = monthDoneTasks;
     el.statMonthPending.textContent = monthPending;
     el.statProgressBar.style.width = `${percent}%`;
@@ -1953,10 +2252,13 @@
       titleWrap.appendChild(title);
 
       if (task.desc && task.desc.trim()) {
-        const desc = document.createElement('div');
-        desc.className = 'task-desc';
-        desc.textContent = task.desc;
-        titleWrap.appendChild(desc);
+        const displayDesc = task.desc.replace(/https?:\/\/docs\.google\.com\/spreadsheets\/[^\s]+/gi, '').trim();
+        if (displayDesc) {
+          const desc = document.createElement('div');
+          desc.className = 'task-desc';
+          desc.textContent = displayDesc;
+          titleWrap.appendChild(desc);
+        }
       }
       content.appendChild(titleWrap);
 
@@ -1987,6 +2289,21 @@
         openLabelPickerForTask(task.id, dateKey);
       });
       tagsRow.appendChild(addTagBtn);
+
+      // Google Sheet Link Button (if sheetUrl or Google Sheet URL in desc)
+      const sheetUrl = extractSheetUrl(task);
+      let sheetBtn = null;
+      if (sheetUrl) {
+        sheetBtn = document.createElement('a');
+        sheetBtn.href = sheetUrl;
+        sheetBtn.target = '_blank';
+        sheetBtn.rel = 'noopener noreferrer';
+        sheetBtn.className = 'btn-sheet-link';
+        sheetBtn.innerHTML = `📊 Sheet ↗`;
+        sheetBtn.title = `เปิด Google Sheet: ${sheetUrl}`;
+        sheetBtn.addEventListener('click', (e) => e.stopPropagation());
+        tagsRow.appendChild(sheetBtn);
+      }
 
       content.appendChild(tagsRow);
 
@@ -2055,7 +2372,7 @@
       });
 
       // Prevent drag on interactive buttons
-      [checkbox, addTagBtn, editBtn, delBtn].forEach(el => {
+      [checkbox, addTagBtn, sheetBtn, editBtn, delBtn].forEach(el => {
         if (el) el.addEventListener('mousedown', (e) => e.stopPropagation());
       });
 
@@ -2204,12 +2521,23 @@
     });
   }
 
+  function extractSheetUrl(task) {
+    if (!task) return '';
+    if (task.sheetUrl && task.sheetUrl.trim()) return task.sheetUrl.trim();
+    if (task.desc) {
+      const match = task.desc.match(/https?:\/\/docs\.google\.com\/spreadsheets\/[^\s]+/i);
+      if (match) return match[0];
+    }
+    return '';
+  }
+
   function handleAddNewTask(e) {
     e.preventDefault();
     const title = el.taskTitleInput.value.trim();
     if (!title) return;
 
     const desc = el.taskDescInput.value.trim();
+    const sheetUrl = el.taskSheetUrlInput ? el.taskSheetUrlInput.value.trim() : '';
     const dateKey = state.activeModalDate;
     if (!dateKey) return;
 
@@ -2223,6 +2551,7 @@
       id: 'task-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4),
       title: title,
       desc: desc,
+      sheetUrl: sheetUrl,
       done: false,
       tags: [...state.newTaskSelectedTagIds],
       attachments: [...state.newTaskAttachments]
@@ -2234,6 +2563,7 @@
     // Reset inputs
     el.taskTitleInput.value = '';
     el.taskDescInput.value = '';
+    if (el.taskSheetUrlInput) el.taskSheetUrlInput.value = '';
     state.newTaskSelectedTagIds = [];
     renderNewTaskSelectedTags();
     state.newTaskAttachments = [];
@@ -2265,6 +2595,11 @@
     el.editTaskDate.value = dateKey;
     el.editTaskTitle.value = task.title;
     el.editTaskDesc.value = task.desc || '';
+    const sheetUrl = task.sheetUrl || extractSheetUrl(task) || '';
+    if (el.editTaskSheetUrl) el.editTaskSheetUrl.value = sheetUrl;
+    if (el.btnOpenEditSheetUrl) {
+      el.btnOpenEditSheetUrl.style.display = sheetUrl ? 'inline-block' : 'none';
+    }
     state.editingTaskAttachments = task.attachments ? JSON.parse(JSON.stringify(task.attachments)) : [];
     renderEditTaskAttachments();
     el.editTaskModal.classList.add('active');
@@ -2282,6 +2617,7 @@
     const dateKey = el.editTaskDate.value;
     const title = el.editTaskTitle.value.trim();
     const desc = el.editTaskDesc.value.trim();
+    const sheetUrl = el.editTaskSheetUrl ? el.editTaskSheetUrl.value.trim() : '';
 
     if (!title || !dateKey || !state.tasks[dateKey]) return;
 
@@ -2290,6 +2626,7 @@
       recordUndo(`แก้ไขงาน "${title}"`);
       task.title = title;
       task.desc = desc;
+      task.sheetUrl = sheetUrl;
       task.attachments = [...state.editingTaskAttachments];
       saveTasks();
       renderDayTasks();
@@ -3094,12 +3431,14 @@
       el.labelEditorTitle.textContent = 'Edit label';
       el.labelTitleInput.value = label ? label.title : '';
       state.selectedEditorColor = label ? label.color : '#0055cc';
+      if (el.labelCountOnceMonthly) el.labelCountOnceMonthly.checked = !!(label && label.countOnceMonthly);
       el.btnDeleteLabel.style.display = 'inline-flex';
     } else {
       // Creating new label
       el.labelEditorTitle.textContent = 'Create label';
       el.labelTitleInput.value = '';
       state.selectedEditorColor = COLOR_PALETTE[0];
+      if (el.labelCountOnceMonthly) el.labelCountOnceMonthly.checked = false;
       el.btnDeleteLabel.style.display = 'none';
     }
 
@@ -3158,6 +3497,14 @@
       textSpan.className = 'label-text';
       textSpan.textContent = label.title;
       pill.appendChild(textSpan);
+
+      if (label.countOnceMonthly) {
+        const oncePill = document.createElement('span');
+        oncePill.className = 'label-count-once-pill';
+        oncePill.textContent = '1 งาน/เดือน';
+        oncePill.title = 'งานที่มี Tag นี้จะถูกนับรวมเป็น 1 งานต่อเดือน';
+        pill.appendChild(oncePill);
+      }
 
       // Clicking pill also toggles checkbox
       pill.addEventListener('click', () => {
@@ -3248,6 +3595,7 @@
     }
 
     const color = state.selectedEditorColor;
+    const countOnceMonthly = el.labelCountOnceMonthly ? el.labelCountOnceMonthly.checked : false;
 
     if (state.editingLabelId) {
       // Update existing
@@ -3255,6 +3603,7 @@
       if (label) {
         label.title = title;
         label.color = color;
+        label.countOnceMonthly = countOnceMonthly;
         showToast(`แก้ไข Tag "${title}" เรียบร้อยแล้ว`);
       }
     } else {
@@ -3265,7 +3614,8 @@
         id: 'lbl-' + Date.now(),
         title: title,
         color: color,
-        pattern: randomPattern
+        pattern: randomPattern,
+        countOnceMonthly: countOnceMonthly
       };
       state.labels.push(newLabel);
       showToast(`สร้าง Tag ใหม่ "${title}" เรียบร้อยแล้ว`);
@@ -3403,6 +3753,20 @@
       renderCalendar();
     });
 
+    // Monthly deduplication toggle
+    if (el.btnToggleDedupMonthly) {
+      el.btnToggleDedupMonthly.addEventListener('click', () => {
+        state.dedupMonthlyTasks = !state.dedupMonthlyTasks;
+        saveSettings();
+        renderCalendar();
+        showToast(
+          state.dedupMonthlyTasks
+            ? '🔁 เปิดโหมดนับงานต่อเนื่อง/ชื่อซ้ำเป็น 1 งานต่อเดือน'
+            : '📋 เปลี่ยนเป็นนับทุกรายการรายวันทั้งหมด'
+        );
+      });
+    }
+
     // Day modal controls
     el.btnCloseDayModal.addEventListener('click', closeDayModal);
     el.addTaskForm.addEventListener('submit', handleAddNewTask);
@@ -3471,6 +3835,15 @@
     el.btnCloseEditTaskModal.addEventListener('click', closeEditTaskModal);
     el.btnCancelEditTask.addEventListener('click', closeEditTaskModal);
     el.editTaskForm.addEventListener('submit', handleSaveEditTask);
+    if (el.editTaskSheetUrl && el.btnOpenEditSheetUrl) {
+      el.editTaskSheetUrl.addEventListener('input', () => {
+        el.btnOpenEditSheetUrl.style.display = el.editTaskSheetUrl.value.trim() ? 'inline-block' : 'none';
+      });
+      el.btnOpenEditSheetUrl.addEventListener('click', () => {
+        const url = el.editTaskSheetUrl.value.trim();
+        if (url) window.open(url, '_blank', 'noopener,noreferrer');
+      });
+    }
 
     // Backup & Restore
     el.btnBackup.addEventListener('click', () => el.backupModal.classList.add('active'));
@@ -3481,6 +3854,71 @@
 
     // Theme toggle
     el.btnThemeToggle.addEventListener('click', toggleTheme);
+
+    // Custom Background Settings
+    if (el.btnBgSettings) el.btnBgSettings.addEventListener('click', openBgSettingsModal);
+    if (el.btnCloseBgModal) el.btnCloseBgModal.addEventListener('click', closeBgSettingsModal);
+    if (el.btnBgPrevMonth) {
+      el.btnBgPrevMonth.addEventListener('click', () => {
+        state.viewMonth--;
+        if (state.viewMonth < 0) {
+          state.viewMonth = 11;
+          state.viewYear--;
+        }
+        renderCalendar();
+      });
+    }
+    if (el.btnBgNextMonth) {
+      el.btnBgNextMonth.addEventListener('click', () => {
+        state.viewMonth++;
+        if (state.viewMonth > 11) {
+          state.viewMonth = 0;
+          state.viewYear++;
+        }
+        renderCalendar();
+      });
+    }
+    if (el.btnUploadBgImage && el.bgImageInput) {
+      el.btnUploadBgImage.addEventListener('click', () => el.bgImageInput.click());
+      el.bgImageInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) handleBgImageUpload(file);
+        e.target.value = '';
+      });
+    }
+    if (el.btnResetBgImage) {
+      el.btnResetBgImage.addEventListener('click', resetCustomBackground);
+    }
+    if (el.bgOverlayRange) {
+      el.bgOverlayRange.addEventListener('input', (e) => {
+        const cfg = getMonthBgConfig(getCurrentBgMonthKey());
+        cfg.overlayOpacity = parseInt(e.target.value, 10);
+        if (el.bgOverlayValue) el.bgOverlayValue.textContent = `${cfg.overlayOpacity}%`;
+        if (el.customBgOverlay) el.customBgOverlay.style.backgroundColor = `rgba(0, 0, 0, ${cfg.overlayOpacity / 100})`;
+        saveBgSettings();
+      });
+    }
+    if (el.bgBlurRange) {
+      el.bgBlurRange.addEventListener('input', (e) => {
+        const cfg = getMonthBgConfig(getCurrentBgMonthKey());
+        cfg.blur = parseInt(e.target.value, 10);
+        if (el.bgBlurValue) el.bgBlurValue.textContent = `${cfg.blur} px`;
+        if (el.customBgLayer) el.customBgLayer.style.filter = `blur(${cfg.blur}px)`;
+        saveBgSettings();
+      });
+    }
+    if (el.bgCardOpacityRange) {
+      el.bgCardOpacityRange.addEventListener('input', (e) => {
+        const cfg = getMonthBgConfig(getCurrentBgMonthKey());
+        cfg.cardOpacity = parseInt(e.target.value, 10);
+        if (el.bgCardOpacityValue) el.bgCardOpacityValue.textContent = `${cfg.cardOpacity}%`;
+        const alpha = Math.max(0.3, Math.min(1, cfg.cardOpacity / 100));
+        const hoverAlpha = Math.min(1, alpha + 0.1);
+        document.documentElement.style.setProperty('--bg-card-alpha', alpha.toFixed(2));
+        document.documentElement.style.setProperty('--bg-card-hover-alpha', hoverAlpha.toFixed(2));
+        saveBgSettings();
+      });
+    }
 
     // Drag & Drop across days modal
     el.btnCloseDragDropModal.addEventListener('click', closeDragDropModal);
@@ -3643,6 +4081,7 @@
       if (e.target === el.dragDropActionModal) closeDragDropModal();
       if (e.target === el.cloudSyncModal) closeCloudSyncModal();
       if (e.target === el.syncConflictModal) closeSyncConflictModal();
+      if (e.target === el.bgSettingsModal) closeBgSettingsModal();
     });
 
     // Save pending debounce sync before leaving/closing tab
@@ -3683,6 +4122,7 @@
         else if (el.dragDropActionModal && el.dragDropActionModal.classList.contains('active')) closeDragDropModal();
         else if (el.cloudSyncModal && el.cloudSyncModal.classList.contains('active')) closeCloudSyncModal();
         else if (el.syncConflictModal && el.syncConflictModal.classList.contains('active')) closeSyncConflictModal();
+        else if (el.bgSettingsModal && el.bgSettingsModal.classList.contains('active')) closeBgSettingsModal();
       }
     });
   }
@@ -3691,6 +4131,7 @@
   function init() {
     loadFromStorage();
     applyTheme();
+    loadAndApplyCustomBackground();
     initEventListeners();
     initFirebase();
     updateDriveStatusUI();
